@@ -27,6 +27,11 @@ type WireGuardEndpointOptions struct {
 	// is an explicit error (see device gating in transport/wireguard).
 	AmneziaWGOptions
 	// lx:end awg
+	// hikkari: destination-resolver — the DNS server that resolves the names
+	// this endpoint dials (connection destinations, not the peer address). Set
+	// it to a server that detours through this endpoint and the names never
+	// leave the tunnel. Empty keeps upstream behaviour: the DNS rules decide.
+	DestinationResolver *DomainResolveOptions `json:"destination_resolver,omitempty"`
 	DialerOptions
 }
 

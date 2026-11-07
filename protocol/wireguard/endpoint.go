@@ -105,6 +105,9 @@ type Endpoint struct {
 	// resumeOnDial wake aborts instead of starting a fresh device rebuild that
 	// Close would then have to wait out. SPEC 030 fast shutdown.
 	closing atomic.Bool
+	// hikkari: destination-resolver — query options for the names this endpoint
+	// dials; the zero value leaves the choice to the DNS rules (upstream).
+	destinationQuery adapter.DNSQueryOptions
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
@@ -139,6 +142,10 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	ep.outboundDialer = outboundDialer
+	ep.destinationQuery, err = destinationQueryOptions(ctx, options.DestinationResolver) // hikkari: destination-resolver
+	if err != nil {
+		return nil, err
+	}
 	var udpTimeout time.Duration
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
@@ -652,7 +659,7 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 		// lx: SPEC 020 — resolve BEFORE waking: the lookup does not go through this
 		// endpoint (a DNS detour through it re-enters DialContext with an IP and
 		// wakes it itself), so a failed lookup must not pay a full Up+handshake.
-		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, w.destinationQuery) // hikkari: destination-resolver
 		if err != nil {
 			return nil, err
 		}
@@ -675,7 +682,7 @@ func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 	w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	if destination.IsDomain() {
 		// lx: SPEC 020 — resolve before waking (see DialContext).
-		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, w.destinationQuery) // hikkari: destination-resolver
 		if err != nil {
 			return nil, netip.Addr{}, err
 		}
