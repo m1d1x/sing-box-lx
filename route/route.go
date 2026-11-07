@@ -528,7 +528,12 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		}
 		if !newDestination.IsValid() {
 			if len(metadata.DestinationAddresses) == 0 {
-				r.logger.WarnContext(ctx, "pre-match: reject ", metadata.Network, " connection from ", metadata.Source.AddrString(), " to fake destination ", metadata.Destination.Fqdn, ": a resolve action is required before routing to outbound/", outbound.Type(), "[", outbound.Tag(), "]")
+				// hikkari: a fake destination nobody resolved goes the connection
+				// path, where the endpoint resolves the name when it dials, instead
+				// of a reject. A config-wide resolve action would hand every other
+				// outbound an address instead of the name (fakeip-flow-fallback).
+				r.logger.DebugContext(ctx, "pre-match: ", metadata.Network, " connection from ", metadata.Source.AddrString(), " to fake destination ", metadata.Destination.Fqdn, " is not resolved, routing it as a connection to outbound/", outbound.Type(), "[", outbound.Tag(), "]")
+				return continueResult
 			} else {
 				r.logger.DebugContext(ctx, "pre-match: reject ", metadata.Network, " connection from ", metadata.Source.AddrString(), " to fake destination ", metadata.Destination.Fqdn, ": no resolved address for this address family")
 			}
