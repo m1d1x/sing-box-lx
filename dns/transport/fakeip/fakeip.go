@@ -27,6 +27,8 @@ type Transport struct {
 	store        adapter.FakeIPStore
 	inet4Enabled bool
 	inet6Enabled bool
+	ctx          context.Context // hikkari: see fakeip_hikkari.go
+	aProbeTag    string          // hikkari: see fakeip_hikkari.go
 }
 
 func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, options option.FakeIPDNSServerOptions) (adapter.DNSTransport, error) {
@@ -42,6 +44,8 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
 		store:            store,
 		inet4Enabled:     inet4Range.IsValid(),
 		inet6Enabled:     inet6Range.IsValid(),
+		ctx:              ctx,
+		aProbeTag:        options.Inet6OnlyWithoutAVia,
 	}, nil
 }
 
@@ -71,6 +75,9 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 	domain := dns.FqdnToDomain(question.Name)
 	if len(domain) > 255 {
 		return nil, E.New("domain name too long for fakeip")
+	}
+	if question.Qtype == mDNS.TypeAAAA && !t.aaaaAllowed(ctx, domain) {
+		return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
 	}
 	address, err := t.store.Create(domain, question.Qtype == mDNS.TypeAAAA)
 	if err != nil {

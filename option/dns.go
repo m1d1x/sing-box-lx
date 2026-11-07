@@ -211,6 +211,8 @@ type RemoteHTTPSDNSServerOptions struct {
 type FakeIPDNSServerOptions struct {
 	Inet4Range *badoption.Prefix `json:"inet4_range,omitempty" examples:"198.18.0.0/15"`
 	Inet6Range *badoption.Prefix `json:"inet6_range,omitempty" examples:"fc00::/18"`
+	// hikkari: tag of the DNS server that answers the A probe, see fakeip_hikkari.go.
+	Inet6OnlyWithoutAVia string `json:"inet6_only_without_a_via,omitempty"`
 }
 
 type DHCPDNSServerOptions struct {
