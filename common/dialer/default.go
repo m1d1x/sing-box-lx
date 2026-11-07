@@ -51,6 +51,7 @@ type DefaultDialer struct {
 	fallbackNetworkType    []C.InterfaceType
 	networkFallbackDelay   time.Duration
 	networkLastFallback    common.TypedValue[time.Time]
+	flowRetryDelay         time.Duration // hikkari: see flow_retry_hikkari.go
 }
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
@@ -248,6 +249,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		networkType:            networkType,
 		fallbackNetworkType:    fallbackNetworkType,
 		networkFallbackDelay:   networkFallbackDelay,
+		flowRetryDelay:         time.Duration(options.FlowRetryDelay),
 	}, nil
 }
 
@@ -283,11 +285,17 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 					return d.udpDialer6.DialContext(ctx, network, address.String())
 				}
 			}
-			if !address.IsIPv6() {
-				return DialSlowContext(&d.dialer4, ctx, network, address)
-			} else {
-				return DialSlowContext(&d.dialer6, ctx, network, address)
+			tcpDialer := &d.dialer4
+			if address.IsIPv6() {
+				tcpDialer = &d.dialer6
 			}
+			// A namespace belongs to this goroutine's thread: no attempts on others.
+			if d.flowRetryDelay > 0 && d.netns == "" {
+				return dialRetryingFlows(ctx, d.flowRetryDelay, func(ctx context.Context) (net.Conn, error) {
+					return DialSlowContext(tcpDialer, ctx, network, address)
+				})
+			}
+			return DialSlowContext(tcpDialer, ctx, network, address)
 		})
 		return d.trackConn(ctx, address, conn, err)
 	} else {

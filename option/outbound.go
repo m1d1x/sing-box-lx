@@ -106,6 +106,8 @@ type AbstractDialerOptions struct {
 	NetworkType                badoption.Listable[InterfaceType] `json:"network_type,omitempty"`
 	FallbackNetworkType        badoption.Listable[InterfaceType] `json:"fallback_network_type,omitempty"`
 	FallbackDelay              badoption.Duration                `json:"fallback_delay,omitempty"`
+	// hikkari: start another TCP attempt from a new source port after this much silence.
+	FlowRetryDelay badoption.Duration `json:"flow_retry_delay,omitempty"`
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
