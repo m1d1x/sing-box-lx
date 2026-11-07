@@ -24,12 +24,11 @@ package group
 //     удерживаемого узла переносит выбор на лучшего кандидата через
 //     penaltyFailoverDial, аварийный режим и клапан действуют как здесь.
 //
-// Ошибки НЕ этого класса штрафа не дают и fallback не запускают: RST означает
-// «узел донёс, назначение отказало» — через другой узел будет тот же отказ;
-// Canceled — клиент ушёл сам. Причинная неоднозначность ошибок (мёртвый узел
-// vs мёртвый сайт) принята: один заблокированный сайт может уронить группу в
-// аварийный режим, но режим деградирует мягко (выбор уходит на здоровые узлы,
-// всё продолжает работать) и смывается первым же ответившим ретестом.
+// Ошибки НЕ этого класса штрафа не дают и fallback не запускают: Canceled —
+// клиент ушёл сам. Причинная неоднозначность ошибок (мёртвый узел vs мёртвый
+// сайт) принята: один заблокированный сайт может уронить группу в аварийный
+// режим, но режим деградирует мягко (выбор уходит на здоровые узлы, всё
+// продолжает работать) и смывается первым же ответившим ретестом.
 // UDP штрафов не генерирует (у ListenPacket нет connect-сигнала), но выбором
 // пользуется общим. round_robin (balancer != nil) не затронут: у пула своя
 // машинерия здоровья (SPEC 019 v2), и его комментарий про «ошибка дайла не
@@ -38,6 +37,7 @@ package group
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync/atomic"
@@ -59,9 +59,13 @@ const (
 	penaltyForcedRetestGap = 2 * time.Minute
 )
 
-// isPathDeadDialError отделяет «путь мёртв» (таймаут/недостижимость — штраф и
-// fallback) от «назначение отказало» (RST — не штраф) и «клиент ушёл» (Canceled).
-// context.DeadlineExceeded — это в том числе 15s-дедлайн SPEC 052.
+// isPathDeadDialError отделяет «путь мёртв» (штраф и fallback) от «клиент ушёл»
+// (Canceled). context.DeadlineExceeded — это в том числе 15s-дедлайн SPEC 052.
+//
+// hikkari: RST, отказ и обрыв на этапе дайла тоже «путь мёртв». Эти ошибки
+// приходят от транспорта до узла: VLESS и Trojan не ждут назначение внутри
+// DialContext, а Hysteria2 сообщает об отказе назначения текстом протокола, не
+// кодом сокета. Без этого RST от ТСПУ оставлял выбор на мёртвом узле до тика.
 func isPathDeadDialError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
@@ -69,7 +73,22 @@ func isPathDeadDialError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
-	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.ETIMEDOUT) {
+	for _, code := range []syscall.Errno{syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ETIMEDOUT, syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.ECONNABORTED, syscall.EPIPE} {
+		if errors.Is(err, code) {
+			return true
+		}
+	}
+	// Windows отдаёт WSA-коды, а одноимённые syscall.E* там — другие числа.
+	// На Unix таких значений errno нет.
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch uintptr(errno) {
+		case 10051, 10053, 10054, 10058, 10060, 10061, 10065: // WSAENETUNREACH, WSAECONNABORTED, WSAECONNRESET, WSAESHUTDOWN, WSAETIMEDOUT, WSAECONNREFUSED, WSAEHOSTUNREACH
+			return true
+		}
+	}
+	// Узел закрыл соединение посреди рукопожатия TLS.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	var netErr net.Error
@@ -192,7 +211,11 @@ func (g *URLTestGroup) pickForDial(network string) adapter.Outbound {
 // moveSelection переносит выбор на узел, доказавший жизнь fallback-дайлом.
 // Без Interrupt: живые соединения не рвём; дерево достижимости (SPEC 020)
 // инвалидируется, как при любом переизборе.
-func (g *URLTestGroup) moveSelection(network string, detour adapter.Outbound) {
+//
+// hikkari: failed — узел, с которого уходим. Сеть, державшаяся на нём же, едет
+// вместе: узел мёртв для обеих, а UDP сам штрафов не генерирует и ждал бы тика,
+// то есть голос стоял бы до минуты после того, как TCP уже переехал.
+func (g *URLTestGroup) moveSelection(network string, detour adapter.Outbound, failed adapter.Outbound) {
 	g.access.Lock()
 	var changed bool
 	switch network {
@@ -201,9 +224,17 @@ func (g *URLTestGroup) moveSelection(network string, detour adapter.Outbound) {
 			g.selectedOutboundTCP = detour
 			changed = true
 		}
+		if g.selectedOutboundUDP == failed && supportsNetwork(detour, N.NetworkUDP) {
+			g.selectedOutboundUDP = detour
+			changed = true
+		}
 	case N.NetworkUDP:
 		if g.selectedOutboundUDP != detour {
 			g.selectedOutboundUDP = detour
+			changed = true
+		}
+		if g.selectedOutboundTCP == failed && supportsNetwork(detour, N.NetworkTCP) {
+			g.selectedOutboundTCP = detour
 			changed = true
 		}
 	}
@@ -246,7 +277,7 @@ func (g *URLTestGroup) penaltyFailoverDial(ctx context.Context, network string, 
 		return nil, nil, false
 	}
 	g.penaltyReset(RealTag(g.outbound, fallback))
-	g.moveSelection(network, fallback)
+	g.moveSelection(network, fallback, failed)
 	return conn, fallback, true
 }
 

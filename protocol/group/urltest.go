@@ -299,12 +299,15 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	if err != nil {
 		return nil, err
 	}
+	stopSuspect := s.group.suspectTimer(N.NetworkName(network), outbound) // hikkari: a dial may park without an error
 	conn, err := outbound.DialContext(ctx, network, destination)
+	stopSuspect()
 	// lx:end chain
 	if err == nil {
 		if s.balancer == nil {
 			s.group.penaltyReset(RealTag(s.outbound, outbound)) // lx: SPEC 054 — успех = доказательство жизни
 		}
+		conn = s.group.watchFirstResponse(N.NetworkName(network), outbound, conn) // hikkari: a dial may succeed on a dead node
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
@@ -344,6 +347,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	conn, err := outbound.ListenPacket(ctx, destination)
 	// lx:end chain
 	if err == nil {
+		conn = s.group.watchVoice(conn) // hikkari: a UDP flow gives no other sign of a dead node
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
@@ -402,6 +406,14 @@ type URLTestGroup struct {
 	penalties           sync.Map
 	forcedRetestRunning atomic.Bool
 	lastForcedRetest    common.TypedValue[time.Time]
+	// hikkari: suspicion probe, see urltest_suspect_hikkari.go.
+	suspectRunning atomic.Bool
+	suspectEnd     atomic.Int64
+	// hikkari: voice watchdog, see urltest_voice_hikkari.go.
+	voiceLast    atomic.Int64 // UnixNano of the last packet out of an active UDP flow
+	voiceRunning atomic.Bool
+	voiceMoved   atomic.Int64 // UnixNano of the last move
+	voiceSilent  atomic.Bool  // "no node answered" already logged for this outage
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
