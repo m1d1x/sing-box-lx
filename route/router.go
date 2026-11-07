@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dnsdiag"
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
@@ -115,7 +116,8 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		endpoint:             service.FromContext[adapter.EndpointManager](ctx), // lx: SPEC 020 — idle tick iterates endpoints
 		dnsHijackSem:         semaphore.NewWeighted(dnsHijackConcurrencyLimit),  // lx: SPEC 046
 	}
-	router.reachDirty.Store(true) // lx: SPEC 020 — first tick computes the reachable set
+	dnsdiag.Start(logFactory.NewLogger("dns")) // hikkari diag: temporary, see common/dnsdiag
+	router.reachDirty.Store(true)              // lx: SPEC 020 — first tick computes the reachable set
 	return router
 }
 

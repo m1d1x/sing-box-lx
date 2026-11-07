@@ -4,8 +4,10 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dnsdiag"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport/local/systemconfig"
@@ -142,15 +144,34 @@ func (t *Transport) Environment() []string {
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	done := make(chan struct{})
 	var (
-		response *mDNS.Msg
-		err      error
+		response   *mDNS.Msg
+		err        error
+		access     sync.Mutex
+		called     bool
+		firstAt    time.Time
+		firstStack string
 	)
 	t.ExchangeAsync(ctx, message, func(callbackResponse *mDNS.Msg, callbackErr error) {
+		// hikkari diag: a second call used to panic on close(done) and take the
+		// whole core down. Keep the core up and log who called, each time.
+		access.Lock()
+		if called {
+			firstCallErr, firstCallAt, firstCallStack := err, firstAt, firstStack
+			access.Unlock()
+			dnsdiag.DoubleCallback(t.logger, message.Question[0].Name, ctx.Err(), firstCallErr, callbackErr, time.Since(firstCallAt), firstCallStack)
+			return
+		}
+		called = true
 		response = callbackResponse
 		err = callbackErr
+		firstAt = time.Now()
+		firstStack = dnsdiag.Stack()
+		access.Unlock()
 		close(done)
 	})
 	<-done
+	access.Lock()
+	defer access.Unlock()
 	return response, err
 }
 

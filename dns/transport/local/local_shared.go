@@ -4,11 +4,14 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dnsdiag"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/dns/transport/local/systemconfig"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -30,6 +33,7 @@ func (t *Transport) serverSetFor(systemConfig *systemconfig.Config) (*localServe
 	if serverSet != nil && serverSet.config == systemConfig {
 		return serverSet, nil
 	}
+	dnsdiag.LocalConfig(t.logger, common.Map(systemConfig.Servers, func(server M.Socksaddr) string { return server.String() }), systemConfig.Attempts, systemConfig.Timeout, systemConfig.UseTCP)
 	serverScope := adapter.NewScope(t.ctx, t.logger)
 	transports := make([]adapter.DNSTransport, 0, len(systemConfig.Servers))
 	for _, serverAddr := range systemConfig.Servers {

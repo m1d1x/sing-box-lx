@@ -7,6 +7,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/dnsdiag"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -71,6 +72,7 @@ func NewUDPRaw(logger logger.ContextLogger, adapter dns.TransportAdapter, dialer
 			if err != nil {
 				return nil, E.Cause(err, "dial UDP connection")
 			}
+			dnsdiag.Dialed(t.serverAddr.String(), conn.LocalAddr())
 			return conn, nil
 		},
 		write:    t.writeQuery,
@@ -154,7 +156,9 @@ func (t *UDPTransport) writeQuery(conn net.Conn, message *mDNS.Msg, queryId uint
 	if err != nil {
 		return err
 	}
-	return common.Error(conn.Write(rawMessage))
+	writeErr := common.Error(conn.Write(rawMessage))
+	dnsdiag.Wrote(t.serverAddr.String(), writeErr)
+	return writeErr
 }
 
 func (t *UDPTransport) readResponse(conn net.Conn) (*mDNS.Msg, error) {
@@ -164,6 +168,7 @@ func (t *UDPTransport) readResponse(conn net.Conn) (*mDNS.Msg, error) {
 	if err != nil {
 		return nil, err
 	}
+	dnsdiag.Replied(t.serverAddr.String())
 	var message mDNS.Msg
 	err = message.Unpack(buffer.Bytes())
 	if err != nil {

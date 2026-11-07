@@ -3,9 +3,11 @@ package route
 import (
 	"context"
 	"net"
+	"path"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dnsdiag"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	dnsOutbound "github.com/sagernet/sing-box/protocol/dns"
@@ -73,11 +75,14 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 		return
 	}
 	r.searchProcessInfo(ctx, &metadata)
+	diagHijack(&message, &metadata)
+	hijackedAt := time.Now()
 	destination := metadata.Destination
 	metadata.Destination = M.Socksaddr{}
 	// lx:begin dns-hijack-async
 	if !r.dnsHijackSem.TryAcquire(1) {
 		r.logger.DebugContext(ctx, "process DNS packet: hijack overloaded, dropping query")
+		dnsdiag.HijackDropped()
 		return
 	}
 	go func() {
@@ -87,11 +92,27 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 			if exchangeErr == nil {
 				exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
 			}
+			dnsdiag.HijackDone(exchangeErr, time.Since(hijackedAt))
 			if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
 				r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))
 			}
 		})
 	}() // lx: SPEC 046
+}
+
+// diagHijack counts who asks what: on a Mac most names come from mDNSResponder,
+// and the core asking itself shows as sing-box.
+func diagHijack(message *mDNS.Msg, metadata *adapter.InboundContext) {
+	process := ""
+	if metadata.ProcessInfo != nil {
+		process = path.Base(metadata.ProcessInfo.ProcessPath)
+	}
+	name, queryType := "?", "?"
+	if len(message.Question) > 0 {
+		name = message.Question[0].Name
+		queryType = mDNS.TypeToString[message.Question[0].Qtype]
+	}
+	dnsdiag.Hijack(process, name, queryType)
 }
 
 func (r *Router) writeDNSPacketResponse(message *mDNS.Msg, response *mDNS.Msg, writer N.PacketWriter, destination M.Socksaddr) error {
