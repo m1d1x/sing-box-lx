@@ -90,6 +90,10 @@ func (r *IPCIDRItem) Match(metadata *adapter.InboundContext) bool {
 	if metadata.Destination.IsIP() {
 		return r.ipSet.Contains(metadata.Destination.Addr)
 	}
+	// hikkari: the flow chose this address, whichever name it now goes by.
+	if metadata.OverriddenDestinationAddr.IsValid() && r.ipSet.Contains(metadata.OverriddenDestinationAddr) {
+		return true
+	}
 	if len(metadata.DestinationAddresses) > 0 {
 		return common.Any(metadata.DestinationAddresses, r.ipSet.Contains)
 	}

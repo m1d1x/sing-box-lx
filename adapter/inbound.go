@@ -88,7 +88,11 @@ type InboundContext struct {
 	FallbackNetworkType []C.InterfaceType
 	FallbackDelay       time.Duration
 
-	DestinationAddresses                []netip.Addr
+	DestinationAddresses []netip.Addr
+	// hikkari: the address a sniff override replaced with the name. Only rules read
+	// it: a dial goes by the name, and on a machine without that address family a
+	// dial to this one would fail, so it stays out of DestinationAddresses.
+	OverriddenDestinationAddr           netip.Addr
 	DNSResponse                         *dns.Msg
 	NamedDNSResponses                   map[string]*dns.Msg
 	DestinationAddressMatchFromResponse bool
@@ -224,4 +228,17 @@ func OverrideContext(ctx context.Context) context.Context {
 		return WithContext(ctx, &newMetadata)
 	}
 	return ctx
+}
+
+// OverrideDestinationWithDomain makes the sniffed name the destination, keeping the
+// address it replaces for ip_cidr rules: a rule about a range still applies to a
+// flow that went there by address.
+func (c *InboundContext) OverrideDestinationWithDomain() {
+	if c.Destination.IsIP() {
+		c.OverriddenDestinationAddr = c.Destination.Addr
+	}
+	c.Destination = M.Socksaddr{
+		Fqdn: c.Domain,
+		Port: c.Destination.Port,
+	}
 }
