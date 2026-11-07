@@ -2,9 +2,11 @@ package v2rayxhttp
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strconv"
 	"sync"
@@ -798,7 +800,49 @@ type packetConn struct {
 	// cancel kills the conn-scoped request context (lx: SPEC 072): the pending
 	// download RoundTrip and any in-flight upload POST die with the conn.
 	cancel context.CancelFunc
+
+	// hikkari: batched upload. Write only appends to upBuf; one uploader
+	// goroutine drains it, so everything written while a POST is in flight
+	// leaves in the next POST (Xray/mihomo behaviour). Without this every
+	// Write costs a full RTT and a 50 pps UDP stream (voice) queues forever.
+	upMu      sync.Mutex
+	upCond    *sync.Cond
+	upBuf     []byte
+	upErr     error
+	upStarted bool
+	upWarnAt  time.Time
+	upPosts   uint64
 }
+
+// upWarn rate-limits upload diagnostics to one line per packetUpWarnEvery.
+func (c *packetConn) upWarn(format string, args ...interface{}) {
+	if c.client.warn == nil {
+		return
+	}
+	now := time.Now()
+	c.upMu.Lock()
+	if now.Sub(c.upWarnAt) < packetUpWarnEvery {
+		c.upMu.Unlock()
+		return
+	}
+	c.upWarnAt = now
+	c.upMu.Unlock()
+	c.client.warn(fmt.Sprintf(format, args...))
+}
+
+// packetUpMaxBuffered bounds the pending upload bytes; Write blocks above it.
+// Kept small on purpose: a big backlog turns a short upload stall into
+// minutes of added latency for real-time UDP (voice) that never drains.
+// Blocking here pushes the drop upstream, where UDP is allowed to lose.
+const packetUpMaxBuffered = 64 << 10
+
+// packetUpSlowPost / packetUpBacklogWarn: thresholds for hikkari diag logs.
+const (
+	packetUpSlowPost    = 700 * time.Millisecond
+	packetUpBacklogWarn = 16 << 10
+	packetUpWarnEvery   = 5 * time.Second
+	packetUpMaxInflight = 16
+)
 
 func newPacketConn(ctx context.Context, client *Client, sessionID string, serverAddr M.Socksaddr, xmux *xmuxRelease) *packetConn {
 	conn := &packetConn{
@@ -810,6 +854,7 @@ func newPacketConn(ctx context.Context, client *Client, sessionID string, server
 		created:    make(chan struct{}),
 		serverAddr: serverAddr,
 	}
+	conn.upCond = sync.NewCond(&conn.upMu)
 	conn.readDeadline = newReadDeadline(func() {
 		conn.breaker.localClosed.Store(true) // lx: SPEC 076 — our teardown, not a remote failure
 		select {
@@ -861,31 +906,123 @@ func (c *packetConn) Read(b []byte) (int, error) {
 	return n, c.breaker.outboundErr(hideTransportError(err), c.readDeadline) // lx: SPEC 082, 094, 104 — after noteRead: the breaker classifies the raw error
 }
 
-// Write delivers a write as one or more sequential upload POSTs. A write larger
-// than sc_max_each_post_bytes is split into multiple sequenced packets; successive
-// posts are throttled by sc_min_posts_interval_ms (anti-burst). Each packet carries
-// the payload per uplink_data_placement.
+// Write queues b for upload and returns immediately (hikkari: batched
+// upload). The uploader goroutine sends the queue as sequential POSTs of at
+// most sc_max_each_post_bytes each; sc_min_posts_interval_ms still throttles
+// them. An upload failure surfaces on the next Write.
 func (c *packetConn) Write(b []byte) (int, error) {
-	maxEach := c.client.meta.scMaxEachPostBytes.rand()
-	if maxEach <= 0 {
-		maxEach = len(b)
+	c.upMu.Lock()
+	defer c.upMu.Unlock()
+	if !c.upStarted {
+		c.upStarted = true
+		go c.uploadLoop()
+		go func() {
+			<-c.ctx.Done()
+			c.upMu.Lock()
+			if c.upErr == nil {
+				c.upErr = net.ErrClosed
+			}
+			c.upMu.Unlock()
+			c.upCond.Broadcast()
+		}()
 	}
-	written := 0
-	for written < len(b) {
-		end := written + maxEach
-		if end > len(b) {
-			end = len(b)
-		}
-		if err := c.sendPacket(b[written:end]); err != nil {
-			return written, err
-		}
-		written = end
+	for c.upErr == nil && len(c.upBuf) > 0 && len(c.upBuf)+len(b) > packetUpMaxBuffered {
+		c.upCond.Wait()
 	}
-	return written, nil
+	if c.upErr != nil {
+		return 0, c.upErr
+	}
+	c.upBuf = append(c.upBuf, b...)
+	c.upCond.Broadcast()
+	return len(b), nil
 }
 
-// sendPacket posts a single sequenced upload chunk.
-func (c *packetConn) sendPacket(b []byte) error {
+func (c *packetConn) uploadLoop() {
+	// Bounds concurrent upload POSTs; the server reorders them by seq
+	// (sc_max_buffered_posts, Xray default 30).
+	inflight := make(chan struct{}, packetUpMaxInflight)
+	for {
+		c.upMu.Lock()
+		for c.upErr == nil && len(c.upBuf) == 0 {
+			c.upCond.Wait()
+		}
+		if c.upErr != nil {
+			c.upMu.Unlock()
+			return
+		}
+		maxEach := c.client.meta.scMaxEachPostBytes.rand()
+		n := len(c.upBuf)
+		if maxEach > 0 && n > maxEach {
+			n = maxEach
+		}
+		chunk := make([]byte, n)
+		copy(chunk, c.upBuf[:n])
+		c.upBuf = append(c.upBuf[:0], c.upBuf[n:]...)
+		backlog := len(c.upBuf)
+		c.upPosts++
+		posts := c.upPosts
+		c.upCond.Broadcast()
+		c.upMu.Unlock()
+
+		if n+backlog > packetUpBacklogWarn {
+			c.upWarn("packet-up session %s: upload backlog %d B (post #%d carries %d B)", c.sessionID, n+backlog, posts, n)
+		}
+
+		select {
+		case inflight <- struct{}{}:
+		case <-c.ctx.Done():
+			return
+		}
+		// Like Xray: launch the POST and wait only until its request is on
+		// the wire, not for the response. Waiting for the response caps the
+		// upload at one batch per RTT, and any RTT spike turns into a backlog
+		// that real-time traffic never drains.
+		wrote := make(chan struct{})
+		var wroteOnce sync.Once
+		markWrote := func() { wroteOnce.Do(func() { close(wrote) }) }
+		started := time.Now()
+		err := c.startPost(chunk, markWrote, func(err error) {
+			<-inflight
+			if took := time.Since(started); took > packetUpSlowPost {
+				c.upWarn("packet-up session %s: slow upload POST #%d: %d B took %s (err=%v)", c.sessionID, posts, n, took.Round(time.Millisecond), err)
+			}
+			if err != nil {
+				c.uploadFailed(err)
+			}
+		})
+		if err != nil {
+			<-inflight
+			c.uploadFailed(err)
+			return
+		}
+		select {
+		case <-wrote:
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
+// uploadFailed records the first upload error, wakes writers and tears the
+// conn down (the server cannot resequence past a lost seq).
+func (c *packetConn) uploadFailed(err error) {
+	c.upMu.Lock()
+	if c.upErr == nil {
+		c.upErr = err
+	}
+	c.upBuf = nil
+	c.upMu.Unlock()
+	c.upCond.Broadcast()
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
+
+// startPost assigns the next seq, honors sc_min_posts_interval_ms and fires
+// one upload POST in the background. onWrote runs once the request is
+// written (or the POST finished, whichever is first); done runs with the
+// POST's result. A non-nil return means the POST was never started.
+func (c *packetConn) startPost(b []byte, onWrote func(), done func(error)) error {
 	c.access.Lock()
 	if c.closed {
 		c.access.Unlock()
@@ -907,36 +1044,40 @@ func (c *packetConn) sendPacket(b []byte) error {
 		}
 	}
 
-	payload := make([]byte, len(b))
-	copy(payload, b)
 	// lx: SPEC 072 — one post is one bounded HTTP exchange: posts ride the
 	// conn-scoped context (they must not die with the dial context), so the
-	// bound has to be their own. Without it a wedged pooled connection blocks
-	// this Write — and the WG send path behind it — indefinitely.
+	// bound has to be their own.
 	postCtx, postCancel := context.WithTimeout(c.ctx, packetUpPostTimeout)
-	defer postCancel()
-	request, err := c.client.newRequest(postCtx, c.client.meta.uplinkHTTPMethod, c.sessionID, strconv.FormatUint(seq, 10), nil)
+	traceCtx := httptrace.WithClientTrace(postCtx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { onWrote() },
+	})
+	request, err := c.client.newRequest(traceCtx, c.client.meta.uplinkHTTPMethod, c.sessionID, strconv.FormatUint(seq, 10), nil)
 	if err != nil {
+		postCancel()
 		return err
 	}
-	c.client.applyUplinkData(request, payload)
+	c.client.applyUplinkData(request, b)
 
-	// lx: 059 — every upload POST rides this stream's pooled connection and counts
-	// against its h_max_request_times. packet-up issues one request per Write, so
-	// counting streams instead of requests here would let the connection outlive
-	// the limit the server was told about.
-	response, err := c.xmux.roundTrip(request)
-	if err != nil {
-		return err
-	}
-	if response.StatusCode != http.StatusOK {
-		response.Body.Close()
-		return E.New("v2ray-xhttp: unexpected upload status: ", response.Status)
-	}
-	drainAndClose(response.Body)
-	// lx: SPEC 076 — a drained 200 upload POST is genuine data flow: reset the
-	// pooled connection's failure streak and the manager backoff.
-	c.xmux.noteSuccess()
+	go func() {
+		defer postCancel()
+		defer onWrote()
+		// lx: 059 — every upload POST rides this stream's pooled connection and
+		// counts against its h_max_request_times.
+		response, err := c.xmux.roundTrip(request)
+		if err != nil {
+			done(err)
+			return
+		}
+		if response.StatusCode != http.StatusOK {
+			response.Body.Close()
+			done(E.New("v2ray-xhttp: unexpected upload status: ", response.Status))
+			return
+		}
+		drainAndClose(response.Body)
+		// lx: SPEC 076 — a drained 200 upload POST is genuine data flow.
+		c.xmux.noteSuccess()
+		done(nil)
+	}()
 	return nil
 }
 

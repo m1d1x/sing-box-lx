@@ -54,6 +54,8 @@ const (
 var _ adapter.V2RayClientTransport = (*Client)(nil)
 
 type Client struct {
+	// hikkari: upload-path warnings (slow POSTs, backlog) for diagnostics.
+	warn       func(string)
 	ctx        context.Context
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
@@ -234,6 +236,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 
 	return &Client{
+		warn:           warn,
 		ctx:            ctx,
 		dialer:         dialer,
 		serverAddr:     serverAddr,
