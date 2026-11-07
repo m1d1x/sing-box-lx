@@ -61,7 +61,8 @@ type Box struct {
 	internalService     []adapter.LifecycleService
 	ntpService          *ntp.Service
 	scope               *adapter.Scope
-	quiesced            atomic.Bool // lx: SPEC 030 — QuiesceForShutdown runs once
+	quiesced            atomic.Bool     // lx: SPEC 030 — QuiesceForShutdown runs once
+	ctx                 context.Context // hikkari: hot reload builds outbounds in the box context
 }
 
 type Options struct {
@@ -514,6 +515,7 @@ func New(options Options) (*Box, error) {
 		internalService:     internalServices,
 		ntpService:          ntpService,
 		scope:               adapter.NewScope(ctx, logFactory.Logger()),
+		ctx:                 ctx, // hikkari: hot reload
 	}, nil
 }
 

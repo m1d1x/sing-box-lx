@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -43,6 +44,7 @@ type Selector struct {
 	history                      *urltest.HistoryStorage
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
+	members                      sync.RWMutex // hikkari: hot reload — guards tags and outbounds
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
@@ -115,12 +117,16 @@ func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 func (s *Selector) Now() string {
 	selected := s.selected.Load()
 	if selected == nil {
+		s.members.RLock() // hikkari: hot reload
+		defer s.members.RUnlock()
 		return s.tags[0]
 	}
 	return selected.Tag()
 }
 
 func (s *Selector) All() []string {
+	s.members.RLock() // hikkari: hot reload
+	defer s.members.RUnlock()
 	return s.tags
 }
 
@@ -129,7 +135,9 @@ func (s *Selector) References() []string {
 }
 
 func (s *Selector) SelectOutbound(tag string) bool {
+	s.members.RLock() // hikkari: hot reload
 	detour, loaded := s.outbounds[tag]
+	s.members.RUnlock()
 	if !loaded {
 		return false
 	}

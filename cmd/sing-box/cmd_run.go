@@ -187,6 +187,8 @@ func run() error {
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
+	hikkariEntry := hikkariSingleEntry(optionsList) // hikkari: hot reload
+	hikkariRequests := hikkariControlRequests()     // hikkari: hot reload
 	for {
 		instance, cancel, createErr := create(options)
 		if createErr != nil {
@@ -194,7 +196,19 @@ func run() error {
 		}
 		runtimeDebug.FreeOSMemory()
 		for {
-			osSignal := <-osSignals
+			var osSignal os.Signal
+			// hikkari:begin hot reload
+			select {
+			case osSignal = <-osSignals:
+			case request := <-hikkariRequests:
+				applied, reply := hikkariReload(instance, hikkariEntry, request)
+				if applied != nil {
+					hikkariEntry = applied
+				}
+				writeHikkariReply(reply)
+				continue
+			}
+			// hikkari:end hot reload
 			if osSignal == syscall.SIGHUP {
 				err = check()
 				if err != nil {
@@ -215,10 +229,16 @@ func run() error {
 			}
 			break
 		}
-		options, err = readConfigAndMerge()
+		// hikkari: a SIGHUP restart reads the files again; hot reload compares against them.
+		optionsList, err = readConfig()
 		if err != nil {
 			return err
 		}
+		options, err = mergeOptionsList(optionsList)
+		if err != nil {
+			return err
+		}
+		hikkariEntry = hikkariSingleEntry(optionsList)
 	}
 }
 

@@ -30,6 +30,7 @@ type Manager struct {
 	optionsByTag  map[string]managedOptions
 	internalByTag map[string]adapter.Outbound
 	// lx:end chain
+	hot hotState // hikkari: hot reload
 }
 
 func NewManager(registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, defaultTag string) *Manager {
@@ -51,6 +52,7 @@ func (m *Manager) Initialize(defaultOutboundFallback func() (adapter.Outbound, e
 
 func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	m.access.Lock()
+	m.rememberScope(scope) // hikkari: hot reload
 	if stage == adapter.StartStateInitialize {
 		if m.defaultTag != "" && m.defaultOutbound == nil {
 			defaultEndpoint, loaded := m.endpoint.Get(m.defaultTag)

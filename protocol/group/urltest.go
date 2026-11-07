@@ -46,7 +46,8 @@ type URLTest struct {
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
-	group                        *URLTestGroup
+	group                        atomic.Pointer[URLTestGroup] // hikkari: hot reload swaps it (urltest_hot_hikkari.go)
+	members                      sync.RWMutex                 // hikkari: hot reload — guards tags
 	checkAccess                  sync.Mutex
 	interruptExternalConnections bool
 	balancer                     *balancer // lx: SPEC 019 — nil for least_test (default)
@@ -117,10 +118,10 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				invalidateReachability(ctx)
 			}
 		}
-		s.group = group
+		s.group.Store(group)
 	case adapter.StartStateStarted:
-		s.group.PostStart()
-		scope.Add(s.group.Close)
+		s.group.Load().PostStart()
+		scope.Add(func() error { return s.group.Load().Close() }) // hikkari: hot reload — close the group current at shutdown
 	}
 	return nil
 }
@@ -128,27 +129,29 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 func (s *URLTest) Now() string {
 	// lx: SPEC 019 — balanced modes have no single "current" node; report the last picked tag.
 	if s.balancer != nil {
-		return s.group.lastSelected.Load()
+		return s.group.Load().lastSelected.Load()
 	}
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
+	if s.group.Load().selectedOutboundTCP != nil {
+		return s.group.Load().selectedOutboundTCP.Tag()
+	} else if s.group.Load().selectedOutboundUDP != nil {
+		return s.group.Load().selectedOutboundUDP.Tag()
 	}
 	// lx: SPEC 019 — cold start: before the first URL-test, selectedOutbound* is nil but
 	// traffic already flows via the Select() fallback (outbounds[0] when no history yet).
 	// Mirror exactly what the next DialContext would pick, so the UI shows the real node
 	// instead of blank. Select() is the same source of truth DialContext uses.
-	if outbound, _ := s.group.Select(N.NetworkTCP); outbound != nil {
+	if outbound, _ := s.group.Load().Select(N.NetworkTCP); outbound != nil {
 		return outbound.Tag()
 	}
-	if outbound, _ := s.group.Select(N.NetworkUDP); outbound != nil {
+	if outbound, _ := s.group.Load().Select(N.NetworkUDP); outbound != nil {
 		return outbound.Tag()
 	}
 	return ""
 }
 
 func (s *URLTest) All() []string {
+	s.members.RLock() // hikkari: hot reload
+	defer s.members.RUnlock()
 	return s.tags
 }
 
@@ -164,7 +167,7 @@ type PoolSlot struct {
 // history and clamped 0->1 for live nodes so 0 in the output unambiguously means dead/untested.
 // lx: SPEC 019 v2 (exposed to clients via the GetPool RPC).
 func (s *URLTest) Pool() []PoolSlot {
-	if s.balancer == nil || s.group == nil {
+	if s.balancer == nil || s.group.Load() == nil {
 		return nil
 	}
 	tags := s.balancer.poolTags()
@@ -179,7 +182,7 @@ func (s *URLTest) Pool() []PoolSlot {
 		if node, loaded := s.outbound.Outbound(tag); loaded {
 			historyTag = RealTag(s.outbound, node)
 		}
-		if history := s.group.history.LoadURLTestHistory(historyTag); history != nil {
+		if history := s.group.Load().history.LoadURLTestHistory(historyTag); history != nil {
 			delay = history.Delay
 			if delay == 0 {
 				delay = 1 // live sub-ms node: never report 0 (0 is reserved for dead/untested)
@@ -206,7 +209,7 @@ func (s *URLTest) Mode() string {
 }
 
 func (s *URLTest) References() []string {
-	group := s.group
+	group := s.group.Load()
 	if group == nil {
 		return nil
 	}
@@ -222,18 +225,18 @@ func (s *URLTest) References() []string {
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.group.URLTest(ctx)
+	return s.group.Load().URLTest(ctx)
 }
 
 func (s *URLTest) CheckOutbounds() {
-	s.group.CheckOutbounds(s.ctx, true)
+	s.group.Load().CheckOutbounds(s.ctx, true)
 }
 
 // selectBalanced picks an outbound per-connection in round_robin mode from the balancer's
 // fixed-size pool. lx: SPEC 019 v2. fallback (Select's outbounds[0]) covers the cold-start
 // window before the first health-check fills the pool. Returns nil only when nothing usable.
 func (s *URLTest) selectBalanced(ctx context.Context, network string, destination M.Socksaddr) adapter.Outbound {
-	fallback, _ := s.group.Select(network)
+	fallback, _ := s.group.Load().Select(network)
 	selected := s.balancer.pick(ctx, destination, fallback, func(tag string) adapter.Outbound {
 		node, _ := s.outbound.Outbound(tag)
 		if node != nil && !common.Contains(node.Network(), network) {
@@ -242,17 +245,17 @@ func (s *URLTest) selectBalanced(ctx context.Context, network string, destinatio
 		return node
 	})
 	if selected != nil {
-		s.group.lastSelected.Store(selected.Tag())
+		s.group.Load().lastSelected.Store(selected.Tag())
 	}
 	return selected
 }
 
 func (s *URLTest) PerformUpdateCheck() {
-	s.group.performUpdateCheck()
+	s.group.Load().performUpdateCheck()
 }
 
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
-	group := s.group
+	group := s.group.Load()
 	if group == nil {
 		return
 	}
@@ -270,7 +273,7 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 }
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	s.group.Touch()
+	s.group.Load().Touch()
 	var outbound adapter.Outbound
 	if s.balancer != nil {
 		switch N.NetworkName(network) {
@@ -284,7 +287,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		case N.NetworkTCP, N.NetworkUDP:
 			// lx: SPEC 054 — penalty-aware pick: аварийный режим обходит кеш
 			// selectedOutbound*; обычный — апстримная семантика (кеш, иначе Select).
-			outbound = s.group.pickForDial(N.NetworkName(network))
+			outbound = s.group.Load().pickForDial(N.NetworkName(network))
 		default:
 			return nil, E.Extend(N.ErrUnknownNetwork, network)
 		}
@@ -299,42 +302,42 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	if err != nil {
 		return nil, err
 	}
-	stopSuspect := s.group.suspectTimer(N.NetworkName(network), outbound) // hikkari: a dial may park without an error
+	stopSuspect := s.group.Load().suspectTimer(N.NetworkName(network), outbound) // hikkari: a dial may park without an error
 	conn, err := outbound.DialContext(ctx, network, destination)
 	stopSuspect()
 	// lx:end chain
 	if err == nil {
 		if s.balancer == nil {
-			s.group.penaltyReset(RealTag(s.outbound, outbound)) // lx: SPEC 054 — успех = доказательство жизни
+			s.group.Load().penaltyReset(RealTag(s.outbound, outbound)) // lx: SPEC 054 — успех = доказательство жизни
 		}
-		conn = s.group.watchFirstResponse(N.NetworkName(network), outbound, conn) // hikkari: a dial may succeed on a dead node
-		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		conn = s.group.Load().watchFirstResponse(N.NetworkName(network), outbound, conn) // hikkari: a dial may succeed on a dead node
+		return s.group.Load().interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// lx: SPEC 019 v2 — in round_robin a dial error must NOT touch the pool: the cause is
 	// unknown (dead node vs. dead destination vs. local network drop). Only the health-check
 	// changes pool membership. least_test keeps the upstream behaviour (drop the history).
 	if s.balancer == nil {
-		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		s.group.Load().history.DeleteURLTestHistory(outbound.Tag())
 		// lx: SPEC 054 — «путь мёртв» → штраф + один fallback-дайл; успех
 		// переносит выбор группы на fallback (без Interrupt).
-		if fbConn, fallback, ok := s.group.penaltyFailoverDial(ctx, N.NetworkName(network), destination, outbound, err); ok {
+		if fbConn, fallback, ok := s.group.Load().penaltyFailoverDial(ctx, N.NetworkName(network), destination, outbound, err); ok {
 			s.logger.InfoContext(ctx, "lx penalty: failover to ", fallback.Tag())
-			return s.group.interruptGroup.NewConn(fbConn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+			return s.group.Load().interruptGroup.NewConn(fbConn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 		}
 	}
 	return nil, err
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	s.group.Touch()
+	s.group.Load().Touch()
 	var outbound adapter.Outbound
 	if s.balancer != nil {
 		outbound = s.selectBalanced(ctx, N.NetworkUDP, destination)
 	} else {
 		// lx: SPEC 054 — общий penalty-aware выбор (штрафы копит только TCP,
 		// UDP ими пользуется).
-		outbound = s.group.pickForDial(N.NetworkUDP)
+		outbound = s.group.Load().pickForDial(N.NetworkUDP)
 	}
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
@@ -347,13 +350,13 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	conn, err := outbound.ListenPacket(ctx, destination)
 	// lx:end chain
 	if err == nil {
-		conn = s.group.watchVoice(conn) // hikkari: a UDP flow gives no other sign of a dead node
-		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		conn = s.group.Load().watchVoice(conn) // hikkari: a UDP flow gives no other sign of a dead node
+		return s.group.Load().interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// lx: SPEC 019 v2 — round_robin dial error leaves the pool untouched (see DialContext).
 	if s.balancer == nil {
-		s.group.history.DeleteURLTestHistory(outbound.Tag())
+		s.group.Load().history.DeleteURLTestHistory(outbound.Tag())
 	}
 	return nil, err
 }
@@ -693,7 +696,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
 			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
+				nestedResult, _ := nested.group.Load().urlTest(b.ctx, force)
 				b.access.Lock()
 				maps.Copy(b.result, nestedResult)
 				b.access.Unlock()
