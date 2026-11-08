@@ -47,6 +47,9 @@ const (
 	// lx:begin trusttunnel
 	TypeTrustTunnel = "trusttunnel"
 	// lx:end trusttunnel
+	// hikkari:begin protocol
+	TypeHikkari = "hikkari"
+	// hikkari:end protocol
 )
 
 const (
@@ -154,6 +157,10 @@ func ProxyDisplayName(proxyType string) string {
 	case TypeTrustTunnel:
 		return "TrustTunnel"
 	// lx:end trusttunnel
+	// hikkari:begin protocol
+	case TypeHikkari:
+		return "Hikkari"
+	// hikkari:end protocol
 	default:
 		return "Unknown"
 	}

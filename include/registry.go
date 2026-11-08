@@ -104,6 +104,9 @@ func OutboundRegistry() *outbound.Registry {
 	vmess.RegisterOutbound(registry)
 	trojan.RegisterOutbound(registry)
 	registerNaiveOutbound(registry)
+	// hikkari:begin protocol
+	registerHikkariOutbound(registry)
+	// hikkari:end protocol
 	// lx:begin trusttunnel
 	registerTrustTunnelOutbound(registry)
 	// lx:end trusttunnel
