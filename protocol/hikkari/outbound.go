@@ -10,6 +10,9 @@
 //	                 and TLS
 //	voice channel    with udp.dup, a second client.Datagram to the same relay:
 //	                 a QUIC connection of its own for calls' voice (v1.03)
+//
+// What the outbound's sessions saw goes to the log as periods (v1.04,
+// period.go).
 package hikkari
 
 import (
@@ -42,6 +45,7 @@ type Outbound struct {
 	datagram *hkclient.Datagram
 	voice    *hkclient.Datagram
 	client   *hkclient.Client
+	periods  *periods
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HikkariOutboundOptions) (adapter.Outbound, error) {
@@ -69,6 +73,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	o := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeHikkari, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		stream:  stream,
+		periods: newPeriods(ctx, logger),
 	}
 	udp := common.PtrValueOrDefault(options.UDP)
 	clientOptions := hkclient.Options{
@@ -77,6 +82,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		RetryAfter:     time.Duration(udp.RetryAfter),
 		Dup:            udp.Dup && !udp.Disabled,
 		Logger:         logger,
+		Book:           o.periods.book,
 	}
 	if !udp.Disabled {
 		server := options.ServerOptions
@@ -115,6 +121,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			TLS:        tlsConfig,
 			Salamander: salamander,
 			Logger:     logger,
+			Book:       o.periods.book,
+			Name:       "datagram",
 		}
 		o.datagram, err = hkclient.NewDatagram(datagramOptions)
 		if err != nil {
@@ -132,6 +140,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			}
 			voiceOptions := datagramOptions
 			voiceOptions.TLS = voiceTLS
+			voiceOptions.Name = "voice"
 			o.voice, err = hkclient.NewDatagram(voiceOptions)
 			if err != nil {
 				return nil, E.Cause(err, "voice channel")
@@ -150,12 +159,18 @@ func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 	}
 	if stage == adapter.StartStateInitialize {
+		// Added first, so it runs after the channels closed: their last
+		// counts are in the last period.
+		scope.Add(o.periods.close)
 		if o.datagram != nil {
 			scope.Add(o.datagram.Close)
 		}
 		if o.voice != nil {
 			scope.Add(o.voice.Close)
 		}
+	}
+	if stage == adapter.StartStateStart {
+		go o.periods.run()
 	}
 	return nil
 }
