@@ -105,6 +105,9 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	}
 	hostname := linkURL.Hostname()
 	port := linkURL.Port()
+	if linkURL.Scheme == "stun" {
+		return stunTest(ctx, hostname, port, detour)
+	}
 	if port == "" {
 		switch linkURL.Scheme {
 		case "http":
