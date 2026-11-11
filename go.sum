@@ -207,6 +207,8 @@ github.com/m1d1x/hikkari-protocol v0.0.0-20261110041642-de87ea9ec77f h1:av/F4vs6
 github.com/m1d1x/hikkari-protocol v0.0.0-20261110041642-de87ea9ec77f/go.mod h1:n6g14ffrmydnUSkndaeZX7+B7y9NjK/EKIkmg7DuYh4=
 github.com/m1d1x/hikkari-protocol v0.0.0-20261110042937-897aa732b9ac h1:IDU2vcGI7vkeNt1JEkzLcjv16TrXiCkz9v7PVAfT1Ug=
 github.com/m1d1x/hikkari-protocol v0.0.0-20261110042937-897aa732b9ac/go.mod h1:n6g14ffrmydnUSkndaeZX7+B7y9NjK/EKIkmg7DuYh4=
+github.com/m1d1x/hikkari-protocol v0.0.0-20261111022549-1f1e3c889c51 h1:MsEPHRjy03mFLFrb3cJ8uRCCC364Z/fCbl2wOGFXwjI=
+github.com/m1d1x/hikkari-protocol v0.0.0-20261111022549-1f1e3c889c51/go.mod h1:n6g14ffrmydnUSkndaeZX7+B7y9NjK/EKIkmg7DuYh4=
 github.com/mattn/go-runewidth v0.0.27 h1:Feg/Oou5zI/wnpgDF6omIU0OokC9GxLC/WRknhVlIR0=
 github.com/mattn/go-runewidth v0.0.27/go.mod h1:3qAiGCV4Koz/yuveO58qUefmUTRm8r0IGEXZ9jeHp/8=
 github.com/mdlayher/netlink v1.11.2 h1:HKh2jqe+omdSWcQ88nrT7INE61B0NXfiSPFdgL4YbNI=

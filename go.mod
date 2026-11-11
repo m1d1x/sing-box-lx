@@ -131,7 +131,7 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
-	github.com/m1d1x/hikkari-protocol v0.0.0-20261110042937-897aa732b9ac
+	github.com/m1d1x/hikkari-protocol v0.0.0-20261111022549-1f1e3c889c51
 	github.com/mdlayher/socket v0.6.0 // indirect
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
