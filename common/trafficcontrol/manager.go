@@ -45,6 +45,9 @@ type Manager struct {
 
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 	eventObserver   *observable.Observer[ConnectionEvent]
+
+	// hikkari: the tunnel's stalls in ms (stall_hikkari.go).
+	stalls stallMeter
 }
 
 func NewManager(outbound adapter.OutboundManager) *Manager {

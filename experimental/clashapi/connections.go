@@ -41,6 +41,8 @@ func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
 			return connectionObject(*metadata)
 		}),
 		"memory": inuseMemory(),
+		// hikkari: the tunnel's stalls in ms since the core started.
+		"hikkariStalls": trafficManager.Stalls(),
 	}
 }
 

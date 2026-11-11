@@ -44,9 +44,12 @@ type Tracker interface {
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	upload := new(atomic.Int64)
 	download := new(atomic.Int64)
+	// hikkari: the counters also time the tunnel's stalls (stall_hikkari.go).
+	trackerMetadata := m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download)
+	read, write := m.stallCounters(&trackerMetadata)
 	tracker := &connTracker{
-		ExtendedConn: bufio.NewInt64CounterConn(conn, []*atomic.Int64{upload}, []*atomic.Int64{download}),
-		metadata:     m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download),
+		ExtendedConn: bufio.NewCounterConn(conn, []N.CountFunc{write}, []N.CountFunc{read}),
+		metadata:     trackerMetadata,
 		manager:      m,
 	}
 	m.join(tracker)
@@ -56,9 +59,12 @@ func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	upload := new(atomic.Int64)
 	download := new(atomic.Int64)
+	// hikkari: the counters also time the tunnel's stalls (stall_hikkari.go).
+	trackerMetadata := m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download)
+	read, write := m.stallCounters(&trackerMetadata)
 	tracker := &packetConnTracker{
-		PacketConn: bufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{upload}, nil, []*atomic.Int64{download}, nil),
-		metadata:   m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download),
+		PacketConn: bufio.NewCounterPacketConn(conn, []N.CountFunc{write}, []N.CountFunc{read}),
+		metadata:   trackerMetadata,
 		manager:    m,
 	}
 	m.join(tracker)
@@ -66,9 +72,14 @@ func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 }
 
 func (m *Manager) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	// hikkari: the counters also time the tunnel's stalls (stall_hikkari.go).
+	trackerMetadata := m.newTrackerMetadata(metadata, matchedRule, matchOutbound, new(atomic.Int64), new(atomic.Int64))
+	read, write := m.stallCounters(&trackerMetadata)
 	return &flowTracker{
-		metadata: m.newTrackerMetadata(metadata, matchedRule, matchOutbound, new(atomic.Int64), new(atomic.Int64)),
+		metadata: trackerMetadata,
 		manager:  m,
+		read:     read,
+		write:    write,
 	}
 }
 
@@ -199,6 +210,8 @@ type flowTracker struct {
 	metadata TrackerMetadata
 	manager  *Manager
 	handle   tun.FlowHandle
+	// hikkari: the byte counters with the stall meter (stall_hikkari.go).
+	read, write func(int64)
 }
 
 func (t *flowTracker) Metadata() *TrackerMetadata {
@@ -211,11 +224,11 @@ func (t *flowTracker) AttachFlow(handle tun.FlowHandle) {
 }
 
 func (t *flowTracker) CountForward(n int) {
-	t.metadata.Upload.Add(int64(n))
+	t.write(int64(n))
 }
 
 func (t *flowTracker) CountReverse(n int) {
-	t.metadata.Download.Add(int64(n))
+	t.read(int64(n))
 }
 
 func (t *flowTracker) FlowEstablished() {
