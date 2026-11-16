@@ -92,7 +92,7 @@ func (r *Router) computeReachability() reachability {
 	if def := r.outbound.Default(); def != nil {
 		seeds = append(seeds, def.Tag())
 	}
-	for _, rule := range r.rules {
+	for _, rule := range r.liveRules() { // hikkari: hot reload swaps them
 		seeds = append(seeds, ruleOutboundTags(rule)...)
 	}
 	// A DNS-server detour is dialable at any moment (every resolution goes

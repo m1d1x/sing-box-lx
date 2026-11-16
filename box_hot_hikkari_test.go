@@ -332,3 +332,192 @@ func TestHotReloadFailedStartLeavesBox(t *testing.T) {
 	defer conn.Close()
 	require.EqualValues(t, 1, proxyA.opened.Load())
 }
+
+// hotRoutingConfig is hotConfig's shape with the routing Hikkari switches
+// between modes: route.final, route.rules and dns.rules.
+func hotRoutingConfig(mixedPort, clashPort uint16, nodes []hotNode, final, rules, dnsRules string) string {
+	var outbounds, tags []string
+	for _, node := range nodes {
+		outbounds = append(outbounds, fmt.Sprintf(`{"type":"http","tag":%q,"server":"127.0.0.1","server_port":%d}`, node.tag, node.port))
+		tags = append(tags, fmt.Sprintf("%q", node.tag))
+	}
+	outbounds = append(outbounds, `{"type":"direct","tag":"direct"}`)
+	outbounds = append(outbounds, fmt.Sprintf(`{"type":"selector","tag":"proxy","outbounds":[%s]}`, strings.Join(tags, ",")))
+	return fmt.Sprintf(`{
+  "log": {"level": "warning"},
+  "dns": {"servers": [{"type": "local", "tag": "dns-local"}, {"type": "udp", "tag": "dns-remote", "server": "127.0.0.1", "server_port": 1, "detour": "proxy"}], "rules": [%s], "final": "dns-local"},
+  "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": %d}],
+  "outbounds": [%s],
+  "route": {"rules": [%s], "final": %q},
+  "experimental": {"clash_api": {"external_controller": "127.0.0.1:%d"}}
+}`, dnsRules, mixedPort, strings.Join(outbounds, ","), rules, final, clashPort)
+}
+
+// The routing mode switch Hikkari does: everything through the tunnel but
+// one port, then only that port through the tunnel. The connection opened
+// before keeps its path; new ones take the new rules at once.
+func TestHotReloadRoutingSwitchesWithoutRestart(t *testing.T) {
+	proxyA := newConnectProxy(t)
+	echoPort, otherEcho := echoServer(t), echoServer(t)
+	mixedPort, clashPort := freePort(t), freePort(t)
+	nodes := []hotNode{{"p-1", proxyA.port()}}
+	bypass := hotRoutingConfig(mixedPort, clashPort, nodes, "proxy",
+		fmt.Sprintf(`{"port":[%d],"outbound":"direct"}`, otherEcho),
+		`{"domain_suffix":["blocked.example"],"server":"dns-local"}`)
+	proxied := hotRoutingConfig(mixedPort, clashPort, nodes, "direct",
+		fmt.Sprintf(`{"port":[%d],"outbound":"proxy"}`, otherEcho),
+		`{"domain_suffix":["blocked.example"],"server":"dns-remote"}`)
+	instance := startHotInstance(t, bypass)
+
+	long := openEcho(t, mixedPort, echoPort)
+	defer long.Close()
+	require.EqualValues(t, 1, proxyA.opened.Load())
+	direct := openEcho(t, mixedPort, otherEcho)
+	direct.Close()
+	require.EqualValues(t, 1, proxyA.opened.Load())
+
+	result := hotReload(t, instance, bypass, proxied)
+	require.True(t, result.Applied, result.Declined)
+	require.Equal(t, []string{"route.rules", "route.final", "dns.rules"}, result.Routing)
+	require.Empty(t, result.Replaced)
+	require.Equal(t, "direct", instance.Outbound().Default().Tag())
+
+	requireEcho(t, long, "still here")
+	fresh := openEcho(t, mixedPort, echoPort)
+	fresh.Close()
+	require.EqualValues(t, 1, proxyA.opened.Load(), "the default now goes direct")
+	listed := openEcho(t, mixedPort, otherEcho)
+	listed.Close()
+	require.EqualValues(t, 2, proxyA.opened.Load(), "the listed port now goes through the tunnel")
+	require.Eventually(t, func() bool { return proxyA.open.Load() == 1 }, 5*time.Second, 10*time.Millisecond, "only the long connection stays open")
+
+	// And back.
+	result = hotReload(t, instance, proxied, bypass)
+	require.True(t, result.Applied, result.Declined)
+	back := openEcho(t, mixedPort, echoPort)
+	back.Close()
+	require.EqualValues(t, 3, proxyA.opened.Load())
+}
+
+// A rule may route to an outbound the same reload adds: routing looks the
+// tag up per connection, after the outbound is published.
+func TestHotReloadRuleToAnAddedOutbound(t *testing.T) {
+	proxyA, proxyB := newConnectProxy(t), newConnectProxy(t)
+	echoPort := echoServer(t)
+	mixedPort, clashPort := freePort(t), freePort(t)
+	before := hotRoutingConfig(mixedPort, clashPort, []hotNode{{"p-1", proxyA.port()}}, "proxy", "", "")
+	after := hotRoutingConfig(mixedPort, clashPort, []hotNode{{"p-1", proxyA.port()}, {"p-2", proxyB.port()}}, "proxy",
+		fmt.Sprintf(`{"port":[%d],"outbound":"p-2"}`, echoPort), "")
+	instance := startHotInstance(t, before)
+	result := hotReload(t, instance, before, after)
+	require.True(t, result.Applied, result.Declined)
+	require.Equal(t, []string{"p-2"}, result.Added)
+	require.Equal(t, []string{"route.rules"}, result.Routing)
+	conn := openEcho(t, mixedPort, echoPort)
+	conn.Close()
+	require.EqualValues(t, 0, proxyA.opened.Load())
+	require.EqualValues(t, 1, proxyB.opened.Load())
+}
+
+func TestHotReloadRoutingDeclinesAndFailsWithoutTouchingTheBox(t *testing.T) {
+	proxyA := newConnectProxy(t)
+	echoPort := echoServer(t)
+	mixedPort, clashPort := freePort(t), freePort(t)
+	nodes := []hotNode{{"p-1", proxyA.port()}}
+	before := hotRoutingConfig(mixedPort, clashPort, nodes, "proxy", "", "")
+	instance := startHotInstance(t, before)
+
+	for name, after := range map[string]string{
+		// Started without process rules, the router has no process search.
+		"process rule":  hotRoutingConfig(mixedPort, clashPort, nodes, "proxy", `{"process_name":["game.exe"],"outbound":"direct"}`, ""),
+		"unknown final": hotRoutingConfig(mixedPort, clashPort, nodes, "nowhere", "", ""),
+		"removed tag":   hotRoutingConfig(mixedPort, clashPort, []hotNode{{"p-2", proxyA.port()}}, "proxy", `{"port":[1],"outbound":"p-1"}`, ""),
+		"rule set":      strings.Replace(before, `"final": "proxy"`, `"final": "proxy", "rule_set": [{"type":"inline","tag":"x","rules":[{"domain":["a.example"]}]}]`, 1),
+	} {
+		result := hotReload(t, instance, before, after)
+		require.False(t, result.Applied, name)
+		require.NotEmpty(t, result.Declined, name)
+	}
+	for name, after := range map[string]string{
+		"unknown rule outbound": hotRoutingConfig(mixedPort, clashPort, nodes, "proxy", `{"port":[1],"outbound":"nowhere"}`, ""),
+		"unknown dns server":    hotRoutingConfig(mixedPort, clashPort, nodes, "proxy", "", `{"domain_suffix":["a.example"],"server":"nowhere"}`),
+	} {
+		_, err := instance.HotReload([]byte(before), []byte(after), parseHotConfig(t, after))
+		require.Error(t, err, name)
+	}
+	require.Equal(t, "proxy", instance.Outbound().Default().Tag())
+	require.Empty(t, instance.Router().Rules())
+	conn := openEcho(t, mixedPort, echoPort)
+	conn.Close()
+	require.EqualValues(t, 1, proxyA.opened.Load())
+}
+
+// Connections keep being routed while the rules switch back and forth: no
+// connection fails, none is matched against a half-built list.
+func TestHotReloadRoutingUnderTraffic(t *testing.T) {
+	proxyA := newConnectProxy(t)
+	echoPort := echoServer(t)
+	mixedPort, clashPort := freePort(t), freePort(t)
+	nodes := []hotNode{{"p-1", proxyA.port()}}
+	one := hotRoutingConfig(mixedPort, clashPort, nodes, "proxy", fmt.Sprintf(`{"port":[%d],"outbound":"direct"}`, echoPort), `{"domain_suffix":["a.example"],"server":"dns-local"}`)
+	two := hotRoutingConfig(mixedPort, clashPort, nodes, "direct", fmt.Sprintf(`{"port":[%d],"outbound":"proxy"}`, echoPort), `{"domain_suffix":["a.example"],"server":"dns-remote"}`)
+	instance := startHotInstance(t, one)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var opened atomic.Int32
+	failures := make(chan error, 64)
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dialer := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", mixedPort), socks.Version5, "", "")
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				conn, err := dialer.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddrHostPort("127.0.0.1", echoPort))
+				if err == nil {
+					_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+					_, err = conn.Write([]byte("ping\n"))
+					if err == nil {
+						var line string
+						line, err = bufio.NewReader(conn).ReadString('\n')
+						if err == nil && line != "ping\n" {
+							err = fmt.Errorf("echo %q", line)
+						}
+					}
+					conn.Close()
+				}
+				if err != nil {
+					select {
+					case failures <- err:
+					default:
+					}
+					return
+				}
+				opened.Add(1)
+			}
+		}()
+	}
+	previous := one
+	for i := range 20 {
+		next := two
+		if i%2 == 1 {
+			next = one
+		}
+		result := hotReload(t, instance, previous, next)
+		require.True(t, result.Applied, result.Declined)
+		previous = next
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		t.Fatal("a connection failed across the reloads: ", err)
+	}
+	require.Greater(t, opened.Load(), int32(20))
+}

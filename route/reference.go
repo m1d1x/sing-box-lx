@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"slices"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
@@ -25,6 +26,7 @@ type ReferenceManager struct {
 	subscriber             *observable.Subscriber[struct{}]
 	keepIdle               map[any]bool
 	unreferencedTransports map[string]bool
+	rulesAccess            sync.Mutex // hikkari: hot reload replaces rules and dnsRules
 }
 
 func NewReferenceManager(ctx context.Context, logger log.ContextLogger, options option.Options) *ReferenceManager {
@@ -124,14 +126,15 @@ func (m *ReferenceManager) update() {
 
 	transportQueue := slices.Clone(m.staticTransports)
 	outboundQueue := slices.Clone(m.staticOutbounds)
-	if !collectDNSRuleReferences(m.dnsRules, mode, &transportQueue) {
+	rules, dnsRules := m.currentRules() // hikkari: hot reload replaces them
+	if !collectDNSRuleReferences(dnsRules, mode, &transportQueue) {
 		defaultTransport := transportManager.Default()
 		if defaultTransport != nil {
 			transportQueue = append(transportQueue, defaultTransport.Tag())
 		}
 	}
 	transportQueue = append(transportQueue, networkManager.DefaultOptions().DomainResolver)
-	if !collectRuleReferences(m.rules, mode, &outboundQueue, &transportQueue) {
+	if !collectRuleReferences(rules, mode, &outboundQueue, &transportQueue) {
 		defaultOutbound := outboundManager.Default()
 		if defaultOutbound != nil {
 			outboundQueue = append(outboundQueue, defaultOutbound.Tag())

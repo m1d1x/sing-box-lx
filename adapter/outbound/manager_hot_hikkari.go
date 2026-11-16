@@ -190,3 +190,19 @@ func (m *Manager) closeDetached() error {
 	m.access.Unlock()
 	return E.Errors(common.Map(scopes, func(scope *adapter.Scope) error { return scope.Close() })...)
 }
+
+// SetDefault points route.final at another outbound or endpoint while the box
+// runs: everything that asks Default() per connection follows at once.
+func (m *Manager) SetDefault(tag string) error {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if outbound, loaded := m.outboundByTag[tag]; loaded {
+		m.defaultTag, m.defaultOutbound = tag, outbound
+		return nil
+	}
+	if endpoint, loaded := m.endpoint.Get(tag); loaded {
+		m.defaultTag, m.defaultOutbound = tag, endpoint
+		return nil
+	}
+	return E.New("default outbound not found: ", tag)
+}

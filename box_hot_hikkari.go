@@ -2,9 +2,11 @@ package box
 
 // hikkari: hot reload — apply a new config to the running box when it differs
 // only in what can change without a restart: the proxy outbounds and the
-// members of the selector / urltest groups over them. Anything else (TUN,
-// inbounds, DNS, rules, endpoints, groups themselves) is declined with the
-// reason, and the caller restarts the core as before.
+// members of the selector / urltest groups over them, and the routing itself:
+// route.rules, route.final and dns.rules (route/router_hot_hikkari.go,
+// dns/router_hot_hikkari.go). Anything else (TUN, inbounds, DNS servers, rule
+// sets, endpoints, groups themselves) is declined with the reason, and the
+// caller restarts the core as before.
 //
 // A replaced outbound keeps serving the connections it already carries: it is
 // retired (closed) only when the connection tracker shows none of them left,
@@ -24,7 +26,9 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -49,6 +53,9 @@ type HotReloadResult struct {
 	Removed  []string `json:"removed,omitempty"`
 	Replaced []string `json:"replaced,omitempty"`
 	Groups   []string `json:"groups,omitempty"`
+	// Routing names what of the routing went live: route.rules, route.final,
+	// dns.rules.
+	Routing []string `json:"routing,omitempty"`
 }
 
 // hotPlan is the difference between two configs, checked to be hot-applicable.
@@ -57,7 +64,14 @@ type hotPlan struct {
 	removed  []string
 	replaced []string
 	groups   []hotGroupChange
+	// routing: which of hotRoutingKeys differ.
+	routing []string
 }
+
+// hotRoutingKeys are the parts of the routing a reload swaps in place.
+var hotRoutingKeys = [][2]string{{"route", "rules"}, {"route", "final"}, {"dns", "rules"}}
+
+func (p *hotPlan) routes(key string) bool { return slices.Contains(p.routing, key) }
 
 type hotGroupChange struct {
 	tag        string
@@ -66,7 +80,7 @@ type hotGroupChange struct {
 }
 
 func (p *hotPlan) empty() bool {
-	return len(p.added) == 0 && len(p.removed) == 0 && len(p.replaced) == 0 && len(p.groups) == 0
+	return len(p.added) == 0 && len(p.removed) == 0 && len(p.replaced) == 0 && len(p.groups) == 0 && len(p.routing) == 0
 }
 
 func (p *hotPlan) result() HotReloadResult {
@@ -76,6 +90,7 @@ func (p *hotPlan) result() HotReloadResult {
 		Removed:  p.removed,
 		Replaced: p.replaced,
 		Groups:   common.Map(p.groups, func(it hotGroupChange) string { return it.tag }),
+		Routing:  p.routing,
 	}
 }
 
@@ -96,13 +111,22 @@ func (s *Box) HotReload(previousContent, nextContent []byte, next option.Options
 	if declined = s.checkHotGroups(plan); declined != "" {
 		return HotReloadResult{Declined: declined}, nil
 	}
+	routing, declined, err := s.prepareHotRouting(plan, next)
+	if err != nil {
+		return HotReloadResult{}, err
+	}
+	if declined != "" {
+		return HotReloadResult{Declined: declined}, nil
+	}
 	// The same option pre-pass New runs (lx: SPEC 098/120), so a hot outbound
 	// is built from the options a cold start would build it from.
 	resolved, _, err := option.ResolveLX(&next)
 	if err != nil {
+		routing.release()
 		return HotReloadResult{}, err
 	}
 	if err = alignPathMTU(&next, resolved.MTUAlignOrDefault(), s.logFactory.NewLogger("lx")); err != nil {
+		routing.release()
 		return HotReloadResult{}, err
 	}
 	byTag := make(map[string]option.Outbound, len(next.Outbounds))
@@ -112,6 +136,7 @@ func (s *Box) HotReload(previousContent, nextContent []byte, next option.Options
 
 	var publish []outbound.HotOutbound
 	abort := func(cause error) (HotReloadResult, error) {
+		routing.release()
 		for _, item := range publish {
 			if closeErr := s.outbound.CloseDetached(item.Outbound); closeErr != nil {
 				s.logger.Warn("hot reload: close unpublished outbound[", item.Outbound.Tag(), "]: ", closeErr)
@@ -148,12 +173,17 @@ func (s *Box) HotReload(previousContent, nextContent []byte, next option.Options
 			return HotReloadResult{}, E.Cause(updateErr, "hot reload: group[", change.tag, "]")
 		}
 	}
+	if err = s.commitHotRouting(routing); err != nil {
+		// Not reachable after prepareHotRouting checked the tag; the caller
+		// restarts to get a clean state.
+		return HotReloadResult{}, E.Cause(err, "hot reload")
+	}
 	s.router.InvalidateReachability()
 	for _, old := range retired {
 		go s.drainRetired(old, swappedAt)
 	}
 	result := plan.result()
-	s.logger.Info("hot reload: applied, outbounds +", len(plan.added), " -", len(plan.removed), " ~", len(plan.replaced), ", groups ", strings.Join(result.Groups, ","))
+	s.logger.Info("hot reload: applied, outbounds +", len(plan.added), " -", len(plan.removed), " ~", len(plan.replaced), ", groups ", strings.Join(result.Groups, ","), ", routing ", strings.Join(result.Routing, ","))
 	return result, nil
 }
 
@@ -250,11 +280,17 @@ func planHotReload(previousContent, nextContent []byte) (*hotPlan, string, error
 	}
 	delete(previous, "outbounds")
 	delete(next, "outbounds")
-	if differing := differingKeys(previous, next); len(differing) > 0 {
-		return nil, "changed outside outbounds: " + strings.Join(differing, ", "), nil
+	plan := &hotPlan{}
+	previousRest, nextRest := withoutHotRouting(previous), withoutHotRouting(next)
+	for _, key := range hotRoutingKeys {
+		if !reflect.DeepEqual(hotRoutingValue(previous, key), hotRoutingValue(next, key)) {
+			plan.routing = append(plan.routing, key[0]+"."+key[1])
+		}
+	}
+	if differing := differingKeys(previousRest, nextRest); len(differing) > 0 {
+		return nil, "changed outside outbounds and routing: " + strings.Join(differing, ", "), nil
 	}
 
-	plan := &hotPlan{}
 	for _, tag := range sortedKeys(previousOutbounds) {
 		before := previousOutbounds[tag]
 		after, kept := nextOutbounds[tag]
@@ -300,10 +336,18 @@ func planHotReload(previousContent, nextContent []byte) (*hotPlan, string, error
 	// A touched tag may be used through a cached reference (a dialer's detour,
 	// a DNS server's detour, an endpoint) only by the groups this reload
 	// re-resolves. Routing rules and route.final look tags up per connection,
-	// but are part of the rest of the config, which must stay unchanged, so a
-	// rule naming a removed tag is refused below as well.
+	// so they may name an added or replaced tag; a removed tag they may not
+	// name at all.
+	removed := make(map[string]bool, len(plan.removed))
+	for _, tag := range plan.removed {
+		removed[tag] = true
+	}
 	for tag := range touched {
-		if path := findReference(next, tag, ""); path != "" {
+		where := nextRest
+		if removed[tag] {
+			where = next
+		}
+		if path := findReference(where, tag, ""); path != "" {
 			return nil, "outbound " + tag + " is referenced at " + path, nil
 		}
 		for otherTag, other := range nextOutbounds {
@@ -488,4 +532,111 @@ func stringList(raw any) []string {
 		}
 	}
 	return result
+}
+
+// hotRouting is the routing a reload prepared aside, published by
+// commitHotRouting after the outbounds.
+type hotRouting struct {
+	route    *route.HotRules
+	dns      *dns.HotRules
+	final    string
+	rules    []option.Rule
+	dnsRules []option.DNSRule
+	changed  bool
+}
+
+func (r *hotRouting) release() {
+	_ = r.route.Close()
+	_ = r.dns.Close()
+}
+
+// prepareHotRouting builds and starts the new route and DNS rules and checks
+// the new route.final, touching nothing that routes yet.
+func (s *Box) prepareHotRouting(plan *hotPlan, next option.Options) (*hotRouting, string, error) {
+	routing := &hotRouting{changed: len(plan.routing) > 0}
+	if !routing.changed {
+		return routing, "", nil
+	}
+	routeOptions := common.PtrValueOrDefault(next.Route)
+	dnsOptions := common.PtrValueOrDefault(next.DNS)
+	routing.rules, routing.dnsRules, routing.final = routeOptions.Rules, dnsOptions.Rules, routeOptions.Final
+	if declined := s.router.HotRulesDeclined(routing.rules, routing.dnsRules); declined != "" {
+		return nil, declined, nil
+	}
+	known := make(map[string]bool, len(next.Outbounds)+len(next.Endpoints))
+	for _, item := range next.Outbounds {
+		known[item.Tag] = true
+	}
+	for _, item := range next.Endpoints {
+		known[item.Tag] = true
+	}
+	if plan.routes("route.final") && (routing.final == "" || !known[routing.final]) {
+		return nil, "route.final " + routing.final + " is not an outbound of the new config", nil
+	}
+	if plan.routes("route.rules") {
+		prepared, err := s.router.PrepareHotRules(routing.rules, func(tag string) bool { return known[tag] })
+		if err != nil {
+			return nil, "", E.Cause(err, "hot reload: route rules")
+		}
+		routing.route = prepared
+	}
+	if plan.routes("dns.rules") {
+		prepared, declined, err := s.dnsRouter.PrepareHotRules(routing.dnsRules)
+		if err != nil || declined != "" {
+			routing.release()
+			if err != nil {
+				return nil, "", E.Cause(err, "hot reload: dns rules")
+			}
+			return nil, declined, nil
+		}
+		routing.dns = prepared
+	}
+	return routing, "", nil
+}
+
+// commitHotRouting publishes the prepared routing; the outbounds it names are
+// already published.
+func (s *Box) commitHotRouting(routing *hotRouting) error {
+	if !routing.changed {
+		return nil
+	}
+	if routing.route != nil {
+		s.router.CommitHotRules(routing.route)
+	}
+	if routing.dns != nil {
+		s.dnsRouter.CommitHotRules(routing.dns)
+	}
+	s.referenceManager.UpdateRules(routing.rules, routing.dnsRules)
+	if routing.final != "" {
+		return s.outbound.SetDefault(routing.final)
+	}
+	return nil
+}
+
+// withoutHotRouting copies config without the parts of hotRoutingKeys, so the
+// rest can be compared and searched for references.
+func withoutHotRouting(config map[string]any) map[string]any {
+	copied := make(map[string]any, len(config))
+	for key, value := range config {
+		copied[key] = value
+	}
+	for _, key := range hotRoutingKeys {
+		section, isMap := copied[key[0]].(map[string]any)
+		if !isMap {
+			continue
+		}
+		trimmed := make(map[string]any, len(section))
+		for sub, value := range section {
+			if sub != key[1] {
+				trimmed[sub] = value
+			}
+		}
+		copied[key[0]] = trimmed
+	}
+	return copied
+}
+
+func hotRoutingValue(config map[string]any, key [2]string) any {
+	section, _ := config[key[0]].(map[string]any)
+	return section[key[1]]
 }

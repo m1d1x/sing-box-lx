@@ -89,6 +89,7 @@ type Router struct {
 	// loop can spawn while a transport dial hangs (dead detour).
 	dnsHijackSem *semaphore.Weighted
 	// lx:end dns-hijack-async
+	hot routerHot // hikkari: hot reload of the route rules
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
@@ -256,8 +257,10 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			r.processCache = processCache
 		}
 	case adapter.StartStatePostStart:
+		// hikkari: hot reload — one closer for whichever rules are live at the
+		// end; a reload closes the rules it replaces itself.
+		scope.Add(r.closeLiveRules)
 		for i, rule := range r.rules {
-			scope.Add(rule.Close)
 			monitor.Start("initialize rule[", i, "]")
 			err := rule.Start()
 			monitor.Finish()
@@ -291,7 +294,7 @@ func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
 }
 
 func (r *Router) Rules() []adapter.Rule {
-	return r.rules
+	return r.liveRules() // hikkari: hot reload swaps them
 }
 
 func (r *Router) AppendTracker(tracker adapter.ConnectionTracker) {
