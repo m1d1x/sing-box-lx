@@ -14,6 +14,11 @@ type HikkariOutboundOptions struct {
 	// TLS is shared: server name and trust roots apply to both channels.
 	OutboundTLSOptionsContainer
 	UDP *HikkariUDPOptions `json:"udp,omitempty"`
+	// Entries are further entries of a cascade to the same relay (v1.07):
+	// each carries both channels on its own server_port; the outbound keeps
+	// a path per entry and leaves a silent one by itself. server and
+	// server_port above are entry 0.
+	Entries []ServerOptions `json:"entries,omitempty"`
 }
 
 type HikkariUDPOptions struct {
